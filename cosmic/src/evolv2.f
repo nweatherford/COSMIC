@@ -1971,6 +1971,41 @@ component.
                 qc = 0.625d0
             endif
          endif
+      elseif(qcflag.eq.4)then
+*
+* Tweak on the Hjellming & Webbink prescription
+*
+         if(kstar(j1).eq.2)then
+            qc = 4.d0
+         elseif(kstar(j1).ge.3.and.kstar(j1).le.6)then
+            qc = 0.51 + 2.0*(1.0 - massc(j1)/mass(j1))**(-1.6)
+         elseif(kstar(j1).eq.8.or.kstar(j1).eq.9)then
+            qc = 0.784d0
+         elseif(kstar(j1).eq.1.or.kstar(j1).eq.7)then
+            qc = 3.d0
+         elseif(kstar(j1).eq.0)then
+            qc = 0.695
+         elseif(kstar(j1).ge.10)then
+            qc = 0.628
+         endif
+      elseif(qcflag.eq.5)then
+*
+* Prescription (for giants) from Chen & Han (2008)
+*
+         if(kstar(j1).eq.2)then
+            qc = 4.d0
+         elseif(kstar(j1).ge.3.and.kstar(j1).le.6)then
+            qc = 1.142 + 1.081*massc(j1) - 2.852*massc(j1)**2
+            qc = qc - 0.35 * dm2/dm1
+         elseif(kstar(j1).eq.8.or.kstar(j1).eq.9)then
+            qc = 0.784d0
+         elseif(kstar(j1).eq.1.or.kstar(j1).eq.7)then
+            qc = 3.d0
+         elseif(kstar(j1).eq.0)then
+            qc = 0.695
+         elseif(kstar(j1).ge.10)then
+            qc = 0.628
+         endif
       endif
 *
 * Allow for manually overriding qcrit values with fixed
