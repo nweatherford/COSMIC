@@ -1978,7 +1978,7 @@ component.
          if(kstar(j1).eq.2)then
             qc = 4.d0
          elseif(kstar(j1).ge.3.and.kstar(j1).le.6)then
-            qc = 0.51 + 2.0*(1.0 - massc(j1)/mass(j1))**(-1.6)
+            qc = 0.51 + (2.0*(1.0 - massc(j1)/mass(j1)))**(-1.0)
          elseif(kstar(j1).eq.8.or.kstar(j1).eq.9)then
             qc = 0.784d0
          elseif(kstar(j1).eq.1.or.kstar(j1).eq.7)then
