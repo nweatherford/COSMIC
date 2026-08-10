@@ -21,11 +21,11 @@
 
 import numpy as np
 
-from cosmic.sample.sampler.sampler import register_sampler
-from cosmic.sample.sampler.independent import Sample #my_independent import Sample
-from cosmic.sample import InitialCMCTable, InitialBinaryTable
-from cosmic.sample.cmc import elson, king
-from cosmic import utils
+from .sampler import register_sampler
+from .independent import Sample
+from .. import InitialCMCTable, InitialBinaryTable
+from ..cmc import elson, king
+from ... import utils
 
 __author__ = "Scott Coughlin <scott.coughlin@ligo.org>"
 __credits__ = [
@@ -38,7 +38,8 @@ __all__ = ["get_cmc_sampler", "CMCSample"]
 
 
 def get_cmc_sampler(
-    cluster_profile, primary_model, ecc_model, porb_model, binfrac_model, met, size, batch_size,  binary_pairing = True, porb_limit = 'hard', porb_limit_msort = 'hard', **kwargs):
+    cluster_profile, primary_model, ecc_model, porb_model, binfrac_model, met, size, batch_size,
+    binary_pairing=True, porb_limit='hard', porb_limit_msort='hard', **kwargs):
     """Generates an initial cluster sample according to user specified models
 
     Parameters
@@ -75,7 +76,7 @@ def get_cmc_sampler(
         Model to sample eccentricity; choices include: thermal, uniform, sana12
 
     porb_model : `str`
-        Model to sample orbital period; choices include: log_uniform, sana12
+        Model to sample orbital period; choices include: log_uniform, sana12, renzo19, raghavan10, moe19, martinez26
 
     msort : `float`
         Stars with M>msort can have different pairing and sampling of companions
@@ -89,8 +90,14 @@ def get_cmc_sampler(
     binfrac_model_msort : `str or float or lambda`
         Same as binfrac_model for M>msort
 
-    porb_limit : `str`
-        Option for how to set the maximum porb; current choices are hs (hard-soft boundary) or tide (tidal limit)
+    porb_limit : `str` or `float`
+         Option for how to set the maximum porb; current string choices are 'hard' (hard-soft boundary) or 'tide' (tidal limit)
+         If a float, interpreted as the max orbital period in days for a binary with total mass = 1 MSun;
+         this will then be converted to a max separation for all binaries.
+
+   porb_limit_msort : `str` or `float`
+         Same as porb_limit for M > msort; only applies if msort is supplied.
+         If a float, max separation is evaluated at binary mass = msort, not 1 Msun.
 
     qmin : `float`
         kwarg which sets the minimum mass ratio for sampling the secondary
