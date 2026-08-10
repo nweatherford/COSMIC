@@ -21,23 +21,24 @@
 
 import numpy as np
 
-from .sampler import register_sampler
-from .independent import Sample
-from .. import InitialCMCTable, InitialBinaryTable
-from ..cmc import elson, king
-from ... import utils
+from cosmic.sample.sampler.sampler import register_sampler
+from cosmic.sample.sampler.independent import Sample #my_independent import Sample
+from cosmic.sample import InitialCMCTable, InitialBinaryTable
+from cosmic.sample.cmc import elson, king
+from cosmic import utils
 
 __author__ = "Scott Coughlin <scott.coughlin@ligo.org>"
 __credits__ = [
    "Carl Rodriguez <carllouisrodriguez@gmail.com>", 
-   "Newlin Weatherford <newlinweatherford2017@u.northwestern.edu>"
+   "Newlin Weatherford <newlinweatherford@gmail.com>",
+   "Christopher O'Connor <christopher.oconnor@northwestern.edu>",
+   "Elena Gonzalez Prieto <elena.prieto@northwestern.edu>"
 ]
 __all__ = ["get_cmc_sampler", "CMCSample"]
 
 
 def get_cmc_sampler(
-    cluster_profile, primary_model, ecc_model, porb_model, binfrac_model, met, size, **kwargs
-):
+    cluster_profile, primary_model, ecc_model, porb_model, binfrac_model, met, size, batch_size,  binary_pairing = True, porb_limit = 'hard', porb_limit_msort = 'hard', **kwargs):
     """Generates an initial cluster sample according to user specified models
 
     Parameters
@@ -74,7 +75,7 @@ def get_cmc_sampler(
         Model to sample eccentricity; choices include: thermal, uniform, sana12
 
     porb_model : `str`
-        Model to sample orbital period; choices include: log_uniform, sana12, renzo19, raghavan10, moe19, martinez26
+        Model to sample orbital period; choices include: log_uniform, sana12
 
     msort : `float`
         Stars with M>msort can have different pairing and sampling of companions
@@ -82,11 +83,14 @@ def get_cmc_sampler(
     pair : `float`
         Sets the pairing of stars M>msort only with stars with M>msort
 
-    binfrac_model : `str or float`
-        Model for binary fraction; choices include: vanHaaften, offner23, or a fraction where 1.0 is 100% binaries
+    binfrac_model : `str or float or lambda`
+        Model for binary fraction; choices include: vanHaaften, offner22, or a fraction where 1.0 is 100% binaries, or a lambda function
 
-    binfrac_model_msort : `str or float`
+    binfrac_model_msort : `str or float or lambda`
         Same as binfrac_model for M>msort
+
+    porb_limit : `str`
+        Option for how to set the maximum porb; current choices are hs (hard-soft boundary) or tide (tidal limit)
 
     qmin : `float`
         kwarg which sets the minimum mass ratio for sampling the secondary
@@ -148,9 +152,6 @@ def get_cmc_sampler(
     if rng_seed != 0:
         np.random.seed(rng_seed)
 
-    # get radii, radial and transverse velocities
-    r, vr, vt = initconditions.set_r_vr_vt(cluster_profile, N=size, **kwargs)
-
     # track the mass in singles and the mass in binaries
     mass_singles = 0.0
     mass_binaries = 0.0
@@ -159,17 +160,57 @@ def get_cmc_sampler(
     n_singles = 0
     n_binaries = 0
 
-    mass1, total_mass1 = initconditions.sample_primary(
-        primary_model, size=size, **kwargs)
-    (
-        mass1_binaries,
-        mass_single,
-        binfrac_binaries,
-        binary_index,
-    ) = initconditions.binary_select(mass1, binfrac_model=binfrac_model, **kwargs)
+    if binary_pairing: #Binaries will be sampled from within the IMF, instead of sampling additional stars 
+        
+        if type(binfrac_model) == str:
+            raise ValueError('You provided an invalid value for binfrac_model. When binary_pairing == True, binfrac_model must be a float or a lambda. ')
 
-    mass2_binaries = initconditions.sample_secondary(
-        mass1_binaries, **kwargs)
+        # Arrays to keep everything 
+        mass1, mass_single, mass1_binaries, mass2_binaries, binary_index = (np.array([]) for _ in range(5))
+
+        if batch_size is None:
+            batch_size = size / 10
+            print("Setting batch size to ", batch_size) 
+
+        while len(mass_single) + 2*len(mass1_binaries) < size: # Generate masses in batches
+       
+            # Sample from the IMF
+            masses_batch, total_mass = initconditions.sample_primary(primary_model, size=int(batch_size), **kwargs)
+
+            # Find secondary masses from within the IMF 
+            (mass1_batch, mass_single_batch, mass1_binaries_batch, mass2_binaries_batch, binary_index_batch) = initconditions.binary_pairing(masses_batch, binfrac_model=binfrac_model, **kwargs)
+
+            # Append this batch
+            binary_index = np.concatenate([binary_index, binary_index_batch]).astype(bool)
+            mass1 = np.concatenate([mass1, mass1_batch])
+            mass_single = np.concatenate([mass_single, mass_single_batch])
+            mass1_binaries = np.concatenate([mass1_binaries, mass1_binaries_batch])
+            mass2_binaries = np.concatenate([mass2_binaries, mass2_binaries_batch])
+
+        # Now we need to randomize the locations of the particles in the arrays so that the set_r_vr_vt function doesn't
+        # initialize the particles with the most-massive having lowest r and the least-massive having highest r
+
+        # First ensure all the mass (and binary_index) arrays have the same length, filling in with zeros where necessary
+        (mass_single_ext, mass1_binaries_ext, mass2_binaries_ext) = np.zeros((3, mass1.size))
+        mass_single_ext   [~binary_index] = mass_single
+        mass1_binaries_ext[ binary_index] = mass1_binaries
+        mass2_binaries_ext[ binary_index] = mass2_binaries
+
+        # Randomize the arrays
+        mass1_index = np.arange(len(mass1))
+        random_indices = np.random.permutation(mass1_index) # Shuffle the indices
+        mass1          = mass1             [random_indices]
+        binary_index   = binary_index      [random_indices]
+        mass_single    = mass_single_ext   [random_indices][~binary_index] # The second bracket expression reduces back to only singles
+        mass1_binaries = mass1_binaries_ext[random_indices][ binary_index] # The second bracket expression reduces back to only primaries
+        mass2_binaries = mass2_binaries_ext[random_indices][ binary_index] # The second bracket expression reduces back to only secondaries
+
+        binary_index = np.where(binary_index)[0] # Necessary to match the binary_index logic for binary_pairing == False
+
+    else:
+        mass1, total_mass1 = initconditions.sample_primary(primary_model, size=size, **kwargs)
+        (mass1_binaries, mass_single, binfrac_binaries, binary_index) = initconditions.binary_select(mass1, binfrac_model=binfrac_model, **kwargs)
+        mass2_binaries = initconditions.sample_secondary(mass1_binaries, **kwargs)
 
     # track the mass sampled
     mass_singles += np.sum(mass_single)
@@ -193,17 +234,64 @@ def get_cmc_sampler(
     # if set_radii_with_BSE is true, but that's not a huge amount of overhead)
     zsun = kwargs.pop("zsun", 0.02)
 
+    # get radii, radial and transverse velocities
+    r, vr, vt = initconditions.set_r_vr_vt(cluster_profile, N=len(mass1), **kwargs)
+
     Reff = initconditions.set_reff(mass1, metallicity=met, zsun=zsun)
     Reff1 = Reff[binary_index]
     Reff2 = initconditions.set_reff(mass2_binaries, metallicity=met, zsun=zsun)
 
+    #print(mass1)
+    #print(Reff1)
+
     # select out the primaries and secondaries that will produce the final kstars
-    porb_max = initconditions.calc_porb_max(mass1, vr, vt, binary_index, mass1_binaries, mass2_binaries, **kwargs)
+    if type(porb_limit) == float:
+        amax = 215.032 * (porb_limit/365.24)**(2./3) # Rsun; porb_limit is the max orbital period (days) of a binary with total mass = 1 MSun
+        porb_max = utils.p_from_a(amax, mass1_binaries, mass2_binaries)
+        #porb_max = np.ones_like(mass1_binaries)*porb_limit
+    elif porb_limit == 'hard':
+        porb_max = initconditions.calc_porb_max(mass1, vr, vt, binary_index, mass1_binaries, mass2_binaries, **kwargs)
+    elif porb_limit == 'tide':
+        porb_max = initconditions.calc_porb_tide(mass1, r, binary_index, mass1_binaries, mass2_binaries, **kwargs)
+    else:
+        raise ValueError("Invalid porb_limit option! Please set to 'hard' or 'tide' or a numerical value")
+    #print("Max porb is ", porb_max, " days")
 
     porb,aRL_over_a = initconditions.sample_porb(
         mass1_binaries, mass2_binaries, Reff1, Reff2, porb_model=porb_model, porb_max=porb_max, size=mass1_binaries.size
     )
     ecc = initconditions.sample_ecc(aRL_over_a, ecc_model, size=mass1_binaries.size)
+
+    # scream if aRL_over_a / (1-ecc) >= 1
+    if np.any(aRL_over_a / (1-ecc) >= 1):
+        print("Bad binaries! How many? This many:", np.sum(aRL_over_a / (1-ecc) >= 1))
+        return False
+    
+    msort = kwargs.pop('msort',None)
+    porb_model_msort = kwargs.pop('porb_model_msort',None)
+    ecc_model_msort = kwargs.pop('ecc_model_msort',None)
+
+    if not ((porb_model_msort is None) or (porb_model_msort is None) or (msort is None) or (porb_limit_msort is None)):
+        (binary_msort_index,) = np.where(mass1_binaries >= msort)
+        mass1_binaries_msort = mass1_binaries[binary_msort_index]
+        mass2_binaries_msort = mass2_binaries[binary_msort_index]
+        Reff1_msort = Reff1[binary_msort_index]
+        Reff2_msort = Reff2[binary_msort_index]
+        if type(porb_limit_msort) == float:
+            amax_msort = 215.032 * (porb_limit_msort/365.24)**(2./3) * msort**(1./3) # Rsun; porb_limit_msort is the max orbital period (days) of a binary with total mass = msort
+            porb_max_msort = utils.p_from_a(amax_msort, mass1_binaries_msort, mass2_binaries_msort)
+        elif porb_limit_msort == 'hard':
+            porb_max_msort = initconditions.calc_porb_max(mass1, vr, vt, binary_msort_index, mass1_binaries_msort, mass2_binaries_msort, **kwargs)
+        elif porb_limit_msort == 'tide':
+            porb_max_msort = initconditions.calc_porb_tide(mass1, r, binary_msort_index, mass1_binaries_msort, mass2_binaries_msort, **kwargs)
+        else:
+            raise ValueError("Invalid porb_limit_msort option! Please set to 'hard' or 'tide' or a numerical value")
+        porb_max[binary_msort_index] = porb_max_msort
+
+        porb[binary_msort_index],aRL_over_a[binary_msort_index] = initconditions.sample_porb(
+        mass1_binaries_msort, mass2_binaries_msort, Reff1_msort, Reff2_msort, porb_model=porb_model_msort, porb_max=porb_max_msort, size=mass1_binaries_msort.size
+        )
+        ecc[binary_msort_index] = initconditions.sample_ecc(aRL_over_a[binary_msort_index], ecc_model_msort, size=mass1_binaries_msort.size)
 
     sep = utils.a_from_p(porb, mass1_binaries, mass2_binaries)
     kstar1 = initconditions.set_kstar(mass1_binaries)
@@ -227,11 +315,10 @@ def get_cmc_sampler(
         sep,
         ecc,
     )
-
     singles_table.metallicity = met
     binaries_table.metallicity = met
     singles_table.virial_radius = kwargs.get("virial_radius",1) 
-    singles_table.tidal_radius = kwargs.get("tidal_radius",1e6) 
+    singles_table.tidal_radius = kwargs.get("tidal_radius",1e13) 
     singles_table.central_bh = kwargs.get("central_bh",0)
     singles_table.scale_with_central_bh = kwargs.get("scale_with_central_bh",False)
     singles_table.mass_of_cluster = np.sum(singles_table["m"])
@@ -260,7 +347,7 @@ def get_cmc_point_mass_sampler(
         'plummer' : Standard Plummer sphere.
             Additional parameters:
             'r_max' : `float`
-                the maximum radius (in virial radii) to sample the clsuter
+                the maximum radius (in virial radii) to sample the cluster
         'elson' : EFF 1987 profile.  Generalization of Plummer that better fits young massive clusters
             Additional parameters:
             'gamma' : `float`
@@ -332,7 +419,7 @@ def get_cmc_point_mass_sampler(
     singles_table.metallicity = 0.02
     binaries_table.metallicity = 0.02
     singles_table.virial_radius = kwargs.get("virial_radius",1)
-    singles_table.tidal_radius = kwargs.get("tidal_radius",1e6)
+    singles_table.tidal_radius = kwargs.get("tidal_radius",1e13)
     singles_table.central_bh = kwargs.get("central_bh",0)
     singles_table.scale_with_central_bh = kwargs.get("scale_with_central_bh",False)
     singles_table.mass_of_cluster = np.sum(singles_table["m"])*size
@@ -400,10 +487,18 @@ class CMCSample(Sample):
         v_orb = 0.7*1.30294*sigma[binary_index]   #sigma * 4/sqrt(3/pi); 0.7 is a factor we use in CMC
         #v_orb = 0.7*1.30294*np.mean(sigma[:20])   #old CMC way of using just core velocity dispersion; TODO: possibly make flag option?
 
-
         ## Maximum semi-major axis just comes from Kepler's 3rd
         ## Note, to keep in code units, we need to divide binary masses by total cluster mass
         amax = (mass1_binary+mass2_binary) / v_orb**2 / np.sum(mass) 
+        eta_min = kwargs.get("eta_min", 1.0) ## eta_min is the minimum "hardness" allowed for initial binaries -- default is 1, probably doesn't need to be less than 0.1
+        eta_min_msort = kwargs.get("eta_min_msort", 1.0) ## Same as eta_min but for M>msort; only applies if msort is supplied
+        if eta_min <= 0:
+            raise ValueError("Invalid eta_min value! Must be > 0.")
+        if eta_min_msort <= 0:
+            raise ValueError("Invalid eta_min_msort value! Must be > 0.")
+        ind_msort = np.argwhere(mass1_binary >= kwargs.get('msort',0))
+        amax[~ind_msort] *= 1/eta_min
+        amax[ind_msort] *= 1/eta_min_msort
 
         ## Convert from code units (virial radii) to RSUN 
         virial_radius = kwargs.get("virial_radius",1) ## get the virial radius of the cluster (uses 1pc if not given)
@@ -415,4 +510,50 @@ class CMCSample(Sample):
 
         return porb_max ## returns orbital period IN DAYS
 
+    def calc_porb_tide(self, mass, r, binary_index, mass1_binary, mass2_binary, **kwargs): 
+
+        ## first, get the local average density -- mass inside each AVEKERNEL interval divided by the volume of that interval; we need this to compute the tidal radius
+        AVEKERNEL = 20
+        rr = r
+        mm = mass
+        sortind = np.argsort(rr)
+        r = rr[sortind]
+        m = mm[sortind]
+        m = np.concatenate([m[AVEKERNEL-1::-1],m,m[:-AVEKERNEL-1:-1]])
+        r = np.concatenate([r[AVEKERNEL-1::-1],r,r[:-AVEKERNEL-1:-1]])
+        # sort the r array and the mass array to match
+        
+        bb = np.zeros_like(mm, dtype = int)
+        bb[binary_index] = 1
+        #b = np.concatenate([bin_mask[AVEKERNEL-1::-1],bin_mask,bin_mask[:-AVEKERNEL-1:-1]])
+        b = bb[sortind]
+        #b = b[AVEKERNEL:-AVEKERNEL]
+
+        mass_loc = np.convolve(m,np.ones(AVEKERNEL),mode='same')[AVEKERNEL:-AVEKERNEL]
+        vol = (4./3)*np.pi*r**3
+        print(mass_loc, mass_loc.size)
+        print(vol, vol.size)
+        vol_loc = np.zeros_like(mass_loc)
+        for i in range(len(vol_loc)):
+            if i < AVEKERNEL:
+                vol_loc[i] = np.abs(vol[i+AVEKERNEL] - vol[0])
+            elif i > len(vol_loc)-AVEKERNEL:
+                vol_loc[i] = np.abs(vol[-1] - vol[i-AVEKERNEL])
+            else:
+                vol_loc[i] = np.abs(vol[i+AVEKERNEL] - vol[i-AVEKERNEL])
+        print(vol_loc, vol_loc.size)
+        rho_loc = mass_loc/vol_loc/np.sum(mass)
+        print(rho_loc, rho_loc.size)
+
+        bin_mask = np.argwhere(b)[:,0]
+        print(bin_mask, bin_mask.size)
+        atide = ((mass1_binary+mass2_binary) / rho_loc[bin_mask])**(1./3)
+        RSUN_PER_PARSEC = 4.435e+7
+        virial_radius = kwargs.get("virial_radius",1) ## get the virial radius of the cluster (uses 1pc if not given)
+        atide *= RSUN_PER_PARSEC * virial_radius ## convert from code units to RSUN
+
+        print(atide/206265., atide.size)
+
+        porb_tide = utils.p_from_a(atide, mass1_binary, mass2_binary)
+        return porb_tide
 
