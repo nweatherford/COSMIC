@@ -22,12 +22,15 @@
 import numpy as np
 import warnings
 import pandas as pd
+import warnings
+from multiprocessing import Pool
+import os
 
 from cosmic import utils
 
-from cosmic.sample.sampler.sampler import register_sampler
-#from cosmic.sampler import register_sampler
-from cosmic.sample import InitialBinaryTable
+from .sampler import register_sampler
+from .. import InitialBinaryTable
+
 
 __author__ = "Katelyn Breivik <katie.breivik@gmail.com>"
 __credits__ = ["Scott Coughlin <scott.coughlin@ligo.org>",
@@ -49,11 +52,14 @@ def get_independent_sampler(
     SF_duration,
     binfrac_model,
     met,
+    SSEDict=None,
     size=None,
     total_mass=np.inf,
     sampling_target="size",
     trim_extra_samples=False,
     q_power_law=0,
+    pool=None,
+    nproc=1,
     **kwargs
 ):
     """Generates an initial binary sample according to user specified models
@@ -79,8 +85,8 @@ def get_independent_sampler(
         Model to sample eccentricity; choices include: thermal, uniform, sana12
 
     porb_model : `str` or `dict`
-        Model to sample orbital period; choices include: log_uniform, sana12, raghavan10, moe19
-        or a custom power law distribution defined with a dictionary with keys "min", "max", and "slope"
+        Model to sample orbital period; choices include: log_uniform, sana12, renzo19, raghavan10, moe19, martinez26,
+        martinez26_ecsn or a custom power law distribution defined with a dictionary with keys "min", "max", and "slope"
         (e.g. {"min": 0.15, "max": 0.55, "slope": -0.55}) would reproduce the Sana+2012 distribution
 
     qmin : `float`
@@ -89,7 +95,8 @@ def get_independent_sampler(
         if q > 0, qmin sets the minimum mass ratio
         q = -1, this limits the minimum mass ratio to be set such that
         the pre-MS lifetime of the secondary is not longer than the full
-        lifetime of the primary if it were to evolve as a single star
+        lifetime of the primary if it were to evolve as a single star.
+        Cannot be used in conjunction with m2_min
 
     m_max : `float`
         kwarg which sets the maximum primary and secondary mass for sampling
@@ -104,6 +111,7 @@ def get_independent_sampler(
     m2_min : `float`
         kwarg which sets the minimum secondary mass for sampling
         the secondary as uniform in mass_2 between m2_min and mass_1
+        Cannot be used in conjunction with qmin
 
     msort : `float`
         Stars with M>msort can have different pairing and sampling of companions
@@ -121,13 +129,16 @@ def get_independent_sampler(
         Duration of constant star formation beginning from SF_Start in Myr
 
     binfrac_model : `str` or `float` or `lambda`
-        Model for binary fraction; choices include: vanHaaften, offner22, or a fraction where 1.0 is 100% binaries, or a lambda function
+        Model for binary fraction; choices include: vanHaaften, offner23, or a fraction where 1.0 is 100% binaries, or a lambda function
 
     binfrac_model_msort : `str` or `float` or `lambda`
         Same as binfrac_model for M>msort
 
     met : `float`
         Sets the metallicity of the binary population where solar metallicity is zsun
+
+    SSEDict: `Dict`
+        Sets the engine to use for individual stellar evolution
 
     size : `int`
         Size of the population to sample
@@ -156,6 +167,14 @@ def get_independent_sampler(
     porb_model_msort : `str` or `dict`
         Same as porb_model for M>msort
 
+    pool : `multiprocessing.Pool`
+        Optional multiprocessing pool to use for parallelizing the sampling.
+        If None, no multiprocessing is used. Default is None.
+
+    nproc : `int`
+        Number of processes to use for multiprocessing if `pool` is None. Default is 1 (no multiprocessing).
+        If `pool` is not None, this argument is ignored.
+
     Returns
     -------
     InitialBinaryTable : `pandas.DataFrame`
@@ -173,6 +192,17 @@ def get_independent_sampler(
     n_binaries : `int`
         Number of binaries needed to generate a population
     """
+
+    if SSEDict is not None:
+        stellar_engine = SSEDict.get("stellar_engine", "sse")
+    else:
+        stellar_engine = "sse"
+    
+    if stellar_engine == "sse" and\
+        (met < 1e-4 or met > 3e-2):
+            warnings.warn("You supplied a metallicity outside of SSE's parameter space [1e-4 <= Z <= 3e-2].\
+                Z will be truncated to this limit.")
+
     if sampling_target == "total_mass" and (total_mass is None or total_mass == np.inf):
         raise ValueError("If `sampling_target == 'total mass'` then `total_mass` must be supplied")
     if size is None and (total_mass is None or total_mass == np.inf):
@@ -184,14 +214,95 @@ def get_independent_sampler(
         raise ValueError(("If `binfrac_model == 0.0` then `sampling_target` must be 'total_mass'. Otherwise "
                           "you are targetting a population of `size` binaries but will never select any."))
 
+    # don't allow users to specify both a qmin and m2_min
+    if "qmin" in kwargs and "m2_min" in kwargs:
+        if kwargs["qmin"] != 0.0 and kwargs["m2_min"] is not None:
+            raise ValueError("You cannot specify both qmin and m2_min, please choose one or the other")
+
     final_kstar1 = [final_kstar1] if isinstance(final_kstar1, (int, float)) else final_kstar1
     final_kstar2 = [final_kstar2] if isinstance(final_kstar2, (int, float)) else final_kstar2
+
+    # check whether a pool already existed (used to know whether to close it at the end)
+    pool_existed_already = pool is not None
+
+    # if no pool was passed in, but nproc > 1, create a pool
+    if not pool_existed_already and nproc > 1:
+        pool = Pool(nproc, initializer=_init_worker)
+
+    # if there's no pool, simply pass the arguments to the worker
+    if pool is None:
+        return _independent_sampler_worker(
+            final_kstar1, final_kstar2, primary_model, ecc_model, porb_model, SF_start, SF_duration,
+            binfrac_model, met, SSEDict=SSEDict, size=size, total_mass=total_mass, sampling_target=sampling_target,
+            trim_extra_samples=trim_extra_samples, q_power_law=q_power_law, kwargs=kwargs
+        )
+
+    # otherwise, we need to split up the sampling into chunks and parallelize across the pool
+    else:
+        # decide on the number of chunks based on the number of processes and the size of the sample
+        # we ideally never want a chunk to sampler fewer than 1000 binaries, or 15000 Msun in total mass
+        # otherwise the overhead of parallelization will dominate the runtime
+        if sampling_target == "size":
+            MIN_BINARIES_PER_CHUNK = 1000
+            n_chunks = min(pool._processes, max(1, size // MIN_BINARIES_PER_CHUNK))
+
+            # divide into chunks (the last one might need to be different since these are integers)
+            chunk_sizes = [size // n_chunks] * n_chunks
+            chunk_sizes[-1] += size % n_chunks
+        else:
+            MIN_MASS_PER_CHUNK = 15000
+            n_chunks = min(pool._processes, max(1, int(total_mass) // MIN_MASS_PER_CHUNK))
+            chunk_sizes = [total_mass / n_chunks] * n_chunks
+
+        # set up the arguments for each chunk
+        chunk_args = [(
+            final_kstar1, final_kstar2, primary_model, ecc_model, porb_model, SF_start, SF_duration,
+            binfrac_model, met, SSEDict, chunk if sampling_target == "size" else size // n_chunks,
+            chunk if sampling_target == "total_mass" else np.inf, sampling_target, trim_extra_samples,
+            q_power_law, kwargs
+        ) for chunk in chunk_sizes]
+
+        # map the worker function across the pool
+        results = pool.starmap(_independent_sampler_worker, chunk_args)
+
+        # combine the results from each chunk
+        binary_tables, mass_singles_list, mass_binaries_list, n_singles_list, n_binaries_list = zip(*results)
+        binary_table = pd.concat(binary_tables, ignore_index=True)
+        mass_singles = sum(mass_singles_list)
+        mass_binaries = sum(mass_binaries_list)
+        n_singles = sum(n_singles_list)
+        n_binaries = sum(n_binaries_list)
+
+        # if we created the pool in this function, we should close it
+        if not pool_existed_already:
+            pool.close()
+            pool.join()
+
+        return binary_table, mass_singles, mass_binaries, n_singles, n_binaries
+
+
+def _independent_sampler_worker(
+    final_kstar1, final_kstar2, primary_model, ecc_model, porb_model, SF_start, SF_duration,
+    binfrac_model, met, SSEDict=None, size=None, total_mass=np.inf, sampling_target="size",
+    trim_extra_samples=False, q_power_law=0, kwargs={}
+):
+    """Worker function for the independent sampler. This is where the actual sampling happens, and is
+    called either directly by `get_independent_sampler` or in parallel across a multiprocessing pool."""
+    if SSEDict is not None:
+        stellar_engine = SSEDict.get("stellar_engine", "sse")
+    else:
+        stellar_engine = "sse"    
+
     primary_min, primary_max, secondary_min, secondary_max = utils.mass_min_max_select(
         final_kstar1, final_kstar2, **kwargs)
     initconditions = Sample()
 
     # set up multiplier if the mass sampling is inefficient
     multiplier = 1
+
+    # if size is passed as None, default to assuming a mean mass of 0.5 Msun (Kroupa IMF between 0.08, 150)
+    if size is None:
+        size = int(total_mass / 0.5)
 
     # track samples to actually return (after masks)
     mass1_singles = []
@@ -298,12 +409,12 @@ def get_independent_sampler(
 
     zsun = kwargs.pop("zsun", 0.02)
 
-    rad1 = initconditions.set_reff(mass1_binary, metallicity=met, zsun=zsun)
-    rad2 = initconditions.set_reff(mass2_binary, metallicity=met, zsun=zsun)
+    rad1 = initconditions.set_reff(mass1_binary, metallicity=met, zsun=zsun, SSEDict=SSEDict)
+    rad2 = initconditions.set_reff(mass2_binary, metallicity=met, zsun=zsun, SSEDict=SSEDict)
 
     # sample periods and eccentricities
     # if the porb_model is moe19, the metallicity needs to be supplied
-    if porb_model == "moe19":
+    if porb_model in ["moe19", "martinez26", "martinez26_ecsn"]:
         porb,aRL_over_a = initconditions.sample_porb(
             mass1_binary, mass2_binary, rad1, rad2, porb_model, met=met, size=mass1_binary.size
         )
@@ -316,8 +427,11 @@ def get_independent_sampler(
     tphysf, metallicity = initconditions.sample_SFH(
         SF_start=SF_start, SF_duration=SF_duration, met=met, size=mass1_binary.size
     )
-    metallicity[metallicity < 1e-4] = 1e-4
-    metallicity[metallicity > 0.03] = 0.03
+
+    if stellar_engine == "sse":
+        metallicity[metallicity < 1e-4] = 1e-4
+        metallicity[metallicity > 0.03] = 0.03
+
     kstar1 = initconditions.set_kstar(mass1_binary)
     kstar2 = initconditions.set_kstar(mass2_binary)
 
@@ -336,8 +450,11 @@ def get_independent_sampler(
         tphysf_singles, metallicity_singles = initconditions.sample_SFH(
             SF_start=SF_start, SF_duration=SF_duration, met=met, size=mass1_singles.size
         )
-        metallicity_singles[metallicity_singles < 1e-4] = 1e-4
-        metallicity_singles[metallicity_singles > 0.03] = 0.03
+
+        if stellar_engine == "sse":
+            metallicity_singles[metallicity_singles < 1e-4] = 1e-4
+            metallicity_singles[metallicity_singles > 0.03] = 0.03
+
         kstar1_singles = initconditions.set_kstar(mass1_singles)
         singles_table = InitialBinaryTable.InitialBinaries(
             mass1_singles,                          # mass1
@@ -371,9 +488,12 @@ def get_independent_sampler(
         n_binaries
     )
 
+def _init_worker():
+    """Ensure that each worker process has a different random seed."""
+    np.random.seed(np.random.get_state()[1][0] + os.getpid())
 
 register_sampler(
-    "my_independent",
+    "independent",
     InitialBinaryTable,
     get_independent_sampler,
     usage="final_kstar1, final_kstar2, binfrac_model, primary_model, ecc_model, SFH_model, component_age, metallicity, size",
@@ -511,7 +631,6 @@ class Sample(object):
             sampled secondary masses with array size matching size of
             primary_mass
         """
-
         qmin = kwargs["qmin"] if "qmin" in kwargs.keys() else 0.0
         m1_min = kwargs["m1_min"] if "m1_min" in kwargs.keys() else 0.08
         m2_min = kwargs["m2_min"] if "m2_min" in kwargs.keys() else None
@@ -669,7 +788,7 @@ class Sample(object):
             masses sampled from the IMF
         
         binfrac_model : : `str or float` 
-            Model for binary fraction; choices include: vanHaaften, offner22, or a fraction where 1.0 is 100% binaries
+            Model for binary fraction; choices include: vanHaaften, offner23, or a fraction where 1.0 is 100% binaries
 
         Optional kwargs are defined in `get_independent_sampler`
 
@@ -813,7 +932,7 @@ class Sample(object):
         either a binary fraction specified by a float or a
         primary-mass dependent binary fraction following
         `van Haaften et al.(2009) <http://adsabs.harvard.edu/abs/2013A%26A...552A..69V>`_ in appdx
-        or `Offner et al.(2022) <https://arxiv.org/abs/2203.10066>`_ in fig 1
+        or `Offner et al.(2023) <https://ui.adsabs.harvard.edu/abs/2023ASPC..534..275O/abstract>`_ in fig 1
 
         Parameters
         ----------
@@ -823,7 +942,7 @@ class Sample(object):
             binfrac_model : str, float, or lambda
                 vanHaaften - primary mass dependent and ONLY VALID up to 100 Msun
                 
-                offner22 - primary mass dependent
+                offner23 - primary mass dependent
                 
                 float - fraction of binaries; 0.5 means 2 in 3 stars are a binary pair while 1
                 means every star is in a binary pair
@@ -874,7 +993,7 @@ class Sample(object):
                     binary_fraction_low < binary_choose_low)
                 (binaryIdx_low,) = np.where(
                     binary_fraction_low >= binary_choose_low)
-            elif binfrac_model == "offner22":
+            elif binfrac_model == "offner23":
                 from scipy.interpolate import BSpline
                 t = [0.0331963853, 0.0331963853, 0.0331963853, 0.0331963853, 0.106066017,
                      0.212132034, 0.424264069, 0.866025404, 1.03077641, 1.11803399,
@@ -898,7 +1017,7 @@ class Sample(object):
                     binary_fraction_low >= binary_choose_low)
             else:
                 raise ValueError(
-                    "You have supplied a non-supported binary fraction model. Please choose vanHaaften, offner22, or a float"
+                    "You have supplied a non-supported binary fraction model. Please choose vanHaaften, offner23, or a float"
                 )
         elif type(binfrac_model) == float:
             if (binfrac_model <= 1.0) & (binfrac_model >= 0.0):
@@ -932,7 +1051,7 @@ class Sample(object):
                 binary_choose_low <= binary_fraction_low)
         else:
             raise ValueError(
-                "You have not supplied a model or a fraction. Please choose either vanHaaften, offner22, or a float"
+                "You have not supplied a model or a fraction. Please choose either vanHaaften, offner23, or a float"
             )
 
         # --- if using a different binary fraction for high-mass systems
@@ -947,7 +1066,7 @@ class Sample(object):
                     binary_fraction_high < binary_choose_high)
                 (binaryIdx_high,) = np.where(
                     binary_fraction_high >= binary_choose_high)
-            elif binfrac_model_msort == "offner22":
+            elif binfrac_model_msort == "offner23":
                 from scipy.interpolate import BSpline
                 t = [0.0331963853, 0.0331963853, 0.0331963853, 0.0331963853, 0.106066017,
                      0.212132034, 0.424264069, 0.866025404, 1.03077641, 1.11803399,
@@ -971,7 +1090,7 @@ class Sample(object):
                     binary_fraction_high >= binary_choose_high)
             else:
                 raise ValueError(
-                    "You have supplied a non-supported binary fraction model. Please choose vanHaaften, offner22, or a float"
+                    "You have supplied a non-supported binary fraction model. Please choose vanHaaften, offner23, or a float"
                 )
         elif (binfrac_model_msort is not None) and (type(binfrac_model_msort) == float):
             if (binfrac_model_msort <= 1.0) & (binfrac_model_msort >= 0.0):
@@ -1017,11 +1136,11 @@ class Sample(object):
             (binaryIdx_high,) = np.where(
                 binary_choose_high <= binary_fraction_high)
         else:
-                raise ValueError("Line 999: You have not supplied a model or a fraction. Please choose either vanHaaften, offner22, a float, or a lambda function")
+                raise ValueError("Line 999: You have not supplied a model or a fraction. Please choose either vanHaaften, offner23, a float, or a lambda function")
 
 #         elif (binfrac_model_msort is not None):
 #             raise ValueError(
-#                 "You have not supplied a model or a fraction. Please choose either vanHaaften, offner22, a float, or a lambda function"
+#                 "You have not supplied a model or a fraction. Please choose either vanHaaften, offner23, a float, or a lambda function"
 #             )
 
         # --- get pertinent info
@@ -1081,6 +1200,16 @@ class Sample(object):
             `Raghavan+2010 <https://ui.adsabs.harvard.edu/abs/2010ApJS..190....1R/abstract>_`
             but with different close binary fractions following 
             `Moe+2019 <https://ui.adsabs.harvard.edu/abs/2019ApJ...875...61M/abstract>_`
+            martinez26 : piecewise model with a power law orbital period following
+            `Sana+2012 <https://ui.adsabs.harvard.edu/abs/2012Sci...337..444S/abstract>_`
+            between 0.15 < log(P/day) < log(3000) for binaries with primaries large enough to undergo an FeCCSN and following
+            `Raghavan+2010 <https://ui.adsabs.harvard.edu/abs/2010ApJS..190....1R/abstract>_`
+            with a log normal orbital period in days with mean_logP = 4.9 and sigma_logP = 2.3 between
+            0 < log10(P/day) < 9 for binaries with low mass primaries. Used in
+            `Martinez+2026 <https://ui.adsabs.harvard.edu/abs/2025arXiv251123285M/abstract>_`. Assumes zsun = 0.02 for the 
+            metallicity dependence to predict outcomes correctly.
+            martinez26_ecsn : same as martinez26 but with the Sana+2012 power law orbital period distribution
+            for primaries massive enough to undergo an ECSN instead of an FeCCSN.
             Custom power law distribution defined with a dictionary with keys "min", "max", and "slope"
             (e.g. porb_model={"min": 0.15, "max": 0.55, "slope": -0.55}) would reproduce the
             Sana+2012 distribution.
@@ -1194,12 +1323,128 @@ class Sample(object):
             logP_dist = get_logP_dist(size, norm_wide, norm_close)
             logP_dist = logP_dist[np.random.randint(0, len(logP_dist), size)]
             porb = 10**logP_dist 
-            aRL_over_a = a_RL / utils.a_from_p(porb,mass1,mass2) 
+            aRL_over_a = a_RL / utils.a_from_p(porb,mass1,mass2)
+
+        elif porb_model == "martinez26" or porb_model == "martinez26_ecsn":
+            # martinez26 model: use sana12 for high mass primaries and raghavan10 for low mass primaries. We fit a metallicity dependent minimum mass for an FeCCSN for 'martinez26,
+            # and we fit for the minmum ecsn mass for 'martinez26_ecsn' using data from the population grid from Martinez+2026.
+            try:
+                met = kwargs.pop('met')
+            except:
+                raise ValueError(
+                    "You have chosen martinez26 or martinez26_ecsn for the orbital period distribution which is a metallicity-dependent distribution. "
+                    "Please specify a metallicity for the population."
+                    )
+            import scipy
+
+            # Create mask for high-mass and low-mass systems
+            def zams_threshold_mass(metallicity, include_ecsn=False, eps=1e-4):
+                z_by_zsun = np.array([
+                    0.005, 0.0061, 0.0074, 0.009, 0.011, 0.01335, 0.01625, 0.0198,
+                    0.0241, 0.02935, 0.03575, 0.0435, 0.05295, 0.0645, 0.0785,
+                    0.09555, 0.1163, 0.1416, 0.1724, 0.20985, 0.25545, 0.311,
+                    0.3786, 0.4609, 0.56105, 0.683, 0.83145, 1.0, 1.2322, 1.5
+                ])
+                fe_ccsne_low = np.array([
+                    6.800704688282865, 6.800897411951605, 6.800897411951605,
+                    6.801021970762962, 6.8025286354545775, 6.802769553556676,
+                    6.803089427396513, 6.803538527040527, 6.804243674222698,
+                    6.80467206993016, 6.80526072924524, 6.8059692527155,
+                    6.806721013425345, 6.81111108784108, 6.917788936421563,
+                    7.011947874916608, 7.08861989201708, 7.149902100414557,
+                    7.204919186852334, 7.238086587027953, 7.329104218495623,
+                    7.421043416504588, 7.514067557855885, 7.667766797129948,
+                    7.714185711362864, 7.866353261910183, 7.938786132196538,
+                    8.03205271544496, 8.222270760441472, 8.266114315589816
+                ]) - eps
+                incl_ecsne_low = np.array([
+                    6.400693921416194, 6.372129640761526, 6.3238994412467235,
+                    6.309580871018385, 6.318731679747097, 6.351048092438493,
+                    6.414738750162605, 6.44081895134046, 6.4754364194354626,
+                    6.520842448126225, 6.579606889898161, 6.626748726227675,
+                    6.697069204683146, 6.81111108784108, 6.917788936421563,
+                    7.011947874916608, 7.08861989201708, 7.149902100414557,
+                    7.204919186852334, 7.198121695356181, 7.221524796053249,
+                    7.350139621902266, 7.4732604008166295, 7.667766797129948,
+                    7.714185711362864, 7.866353261910183, 7.938786132196538,
+                    8.03205271544496, 8.222270760441472, 8.266114315589816
+                ]) - eps
+
+                masses = incl_ecsne_low if include_ecsn else fe_ccsne_low
+
+                #normalize all metallicities with zsun=0.02
+                metallicity_normalized = metallicity / 0.02
+
+                # take boundary value outside range
+                if metallicity_normalized <= z_by_zsun.min():
+                    return masses[0]
+                if metallicity_normalized >= z_by_zsun.max():
+                    return masses[-1]
+
+                # interpolate in log(Z)
+                logZ = np.log10(z_by_zsun)
+                logZ_target = np.log10(metallicity_normalized)
+
+                # find bracketing indices
+                idx = np.searchsorted(logZ, logZ_target) - 1
+
+                z1, z2 = logZ[idx], logZ[idx + 1]
+                m1, m2 = masses[idx], masses[idx + 1]
+
+                # linear interpolation in logZ
+                frac = (logZ_target - z1) / (z2 - z1)
+                mass_interp = m1 + frac * (m2 - m1)
+
+                return mass_interp
+
+            include_ecsn = porb_model == "martinez26_ecsn"
+            threshold_mass = zams_threshold_mass(met, include_ecsn=include_ecsn)
+            (ind_massive,) = np.where(mass1 >= threshold_mass)
+            (ind_lowmass,) = np.where(mass1 < threshold_mass)
             
+            # Initialize porb array
+            porb = np.zeros(size)
+            
+            # sana12 for massive systems with upper bound 3000 days
+            if len(ind_massive) > 0:
+                if porb_max is None:
+                    log10_porb_max_sana = np.log10(3000)
+                else:
+                    log10_porb_max_sana = np.minimum(np.log10(3000), np.log10(porb_max))
+                
+                log10_porb_min_sana = np.array([0.15]*len(ind_massive))
+                RL_porb_sana = utils.p_from_a(a_min[ind_massive], mass1[ind_massive], mass2[ind_massive])
+                log10_RL_porb_sana = np.log10(RL_porb_sana)
+                log10_porb_min_sana[log10_porb_min_sana < log10_RL_porb_sana] = log10_RL_porb_sana[log10_porb_min_sana < log10_RL_porb_sana]
+                
+                porb[ind_massive] = 10 ** utils.rndm(a=log10_porb_min_sana, b=log10_porb_max_sana, g=-0.55, size=len(ind_massive))
+            
+            # Raghavan10 for low-mass systems (mass1 < 8.0)
+            if len(ind_lowmass) > 0:
+                if porb_max is None:
+                    log10_porb_max_ragh = 9.0
+                else:
+                    log10_porb_max_ragh = np.minimum(9.0, np.log10(porb_max))
+                
+                # Handle array vs scalar case for log10_porb_max_ragh
+                if isinstance(log10_porb_max_ragh, np.ndarray):
+                    log10_porb_max_ragh = log10_porb_max_ragh[ind_lowmass]
+                
+                lower = np.log10(porb_RL)
+                upper = log10_porb_max_ragh
+                mu = 4.9
+                sigma = 2.3
+                
+                # Sample from truncated normal distribution
+                porb[ind_lowmass] = 10 ** (scipy.stats.truncnorm.rvs(
+                    (lower-mu)/sigma, (upper-mu)/sigma, loc=mu, scale=sigma, size=len(ind_lowmass)
+                ))
+            
+            aRL_over_a = a_RL / utils.a_from_p(porb, mass1, mass2)
 
         else:
             raise ValueError(
-                "You have supplied a non-supported model; Please choose either log_flat, sana12, renzo19, raghavan10, or moe19"
+                "You have supplied a non-supported model; Please choose either log_uniform, sana12, renzo19, raghavan10, moe19, or martinez26"
             )
         return porb, aRL_over_a 
 
@@ -1317,7 +1562,7 @@ class Sample(object):
 
         return kstar
 
-    def set_reff(self, mass, metallicity, zsun=0.02):
+    def set_reff(self ,mass, metallicity, zsun=0.02, SSEDict=None, **kwargs):
         """
         Better way to set the radii from BSE, by calling it directly
 
@@ -1329,13 +1574,46 @@ class Sample(object):
         """
 
         from cosmic import _evolvebin
-
+        from cosmic.evolve import read_tracks_for_METISSE
 
         max_array_size = 100000
         total_length = len(mass)
         radii = np.zeros(total_length)
 
         _evolvebin.metvars.zsun = zsun
+
+        if (SSEDict == None) or (SSEDict["stellar_engine"] == "sse"):
+            _evolvebin.se_flags.using_sse = True
+            _evolvebin.se_flags.using_metisse = False
+            _evolvebin.metissevars.path_to_tracks = ""
+            _evolvebin.metissevars.path_to_he_tracks = ""
+            _evolvebin.metissevars.z_match_limit = 1e-2
+            _evolvebin.metissevars.METISSE_verbose = False
+        elif SSEDict["stellar_engine"] == "metisse":
+            z_accuracy_limit = SSEDict.get("z_accuracy_limit", 1e-2)
+            METISSE_verbose = SSEDict.get("metisse_verbose", False)
+            _evolvebin.se_flags.using_metisse = True
+            _evolvebin.se_flags.using_sse = False
+            _evolvebin.metissevars.path_to_tracks = SSEDict["path_to_tracks"]
+            _evolvebin.metissevars.path_to_he_tracks = SSEDict["path_to_he_tracks"]
+            _evolvebin.metissevars.z_match_limit = z_accuracy_limit
+            _evolvebin.metissevars.METISSE_verbose = METISSE_verbose
+            
+            _ = read_tracks_for_METISSE(
+                path_to_tracks=SSEDict['path_to_tracks'], 
+                IBT_Z=metallicity,
+                z_accuracy_limit=z_accuracy_limit,
+                is_he=False
+                )
+            if (SSEDict['path_to_he_tracks'] != ''):
+                _ = read_tracks_for_METISSE(
+                    path_to_tracks=SSEDict['path_to_he_tracks'], 
+                    IBT_Z=metallicity,
+                    z_accuracy_limit=z_accuracy_limit,
+                    is_he=True
+                    )
+        else:
+            raise ValueError("Use either 'sse' or 'metisse' as stellar engine")
 
         idx = 0
         while total_length > max_array_size:
@@ -1352,7 +1630,7 @@ class Sample(object):
 
         length_remaining = total_length
 
-        ## if smaller than 10^5, need to pad out the array
+        # if smaller than 10^5, need to pad out the array
         temp_mass = np.zeros(max_array_size)
         temp_mass[:length_remaining] = mass[-length_remaining:]
 
