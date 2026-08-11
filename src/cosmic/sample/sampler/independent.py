@@ -1267,7 +1267,7 @@ class Sample(object):
             import scipy
             lower = np.log10(porb_RL)
             # If using CMC, use the smaller of 5.5 or the maximum porb allowed in the host cluster (usually the local hard/soft boundary)
-            upper = 5.5 if porb_max is None else np.minimum(5.5, np.log10(porb_max)) 
+            upper = 9 if porb_max is None else np.minimum(5.5, np.log10(porb_max)) 
             mu = 4.9
             sigma = 2.3
             porb = 10 ** scipy.stats.truncnorm.rvs((lower-mu)/sigma, (upper-mu)/sigma, loc=mu, scale=sigma, size=size)
@@ -1413,7 +1413,7 @@ class Sample(object):
                     log10_porb_max_sana = np.minimum(np.log10(3000), np.log10(porb_max))
                 
                 log10_porb_min_sana = np.array([0.15]*len(ind_massive))
-                RL_porb_sana = utils.p_from_a(a_min[ind_massive], mass1[ind_massive], mass2[ind_massive])
+                RL_porb_sana = utils.p_from_a(a_RL[ind_massive], mass1[ind_massive], mass2[ind_massive])
                 log10_RL_porb_sana = np.log10(RL_porb_sana)
                 log10_porb_min_sana[log10_porb_min_sana < log10_RL_porb_sana] = log10_RL_porb_sana[log10_porb_min_sana < log10_RL_porb_sana]
                 
