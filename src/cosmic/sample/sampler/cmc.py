@@ -85,7 +85,7 @@ def get_cmc_sampler(
         Sets the pairing of stars M>msort only with stars with M>msort
 
     binfrac_model : `str or float or lambda`
-        Model for binary fraction; choices include: vanHaaften, offner22, or a fraction where 1.0 is 100% binaries, or a lambda function
+        Model for binary fraction; choices include: vanHaaften, offner23, or a fraction where 1.0 is 100% binaries, or a lambda function
 
     binfrac_model_msort : `str or float or lambda`
         Same as binfrac_model for M>msort
